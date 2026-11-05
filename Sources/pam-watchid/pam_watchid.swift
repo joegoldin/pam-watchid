@@ -1,4 +1,5 @@
 import LocalAuthentication
+import PAMSupport
 
 // MARK: (Re)define PAM constants here so we don't need to import .h files.
 
@@ -17,6 +18,10 @@ public typealias pam_handle_t = UnsafeRawPointer?
 public func pam_sm_authenticate(pamh: pam_handle_t, flags: CInt, argc: CInt, argv: vchar) -> CInt {
     let sudoArguments = ProcessInfo.processInfo.arguments
     if sudoArguments.contains("-A") || sudoArguments.contains("--askpass") {
+        return PAM_IGNORE
+    }
+    guard watchid_session_matches_pam_user(pamh) != 0,
+          watchid_pin_module() != 0 else {
         return PAM_IGNORE
     }
 
@@ -47,7 +52,16 @@ public func pam_sm_authenticate(pamh: pam_handle_t, flags: CInt, argc: CInt, arg
         result = success ? PAM_SUCCESS : PAM_AUTH_ERR
     }
 
-    semaphore.wait()
+    // Never read the callback's result after a timeout: cancellation and a
+    // late successful reply can race with this return, but cannot authorize it.
+    if semaphore.wait(timeout: .now() + .seconds(5)) == .timedOut {
+        context.invalidate()
+        return PAM_IGNORE
+    }
+    context.invalidate()
+    if result == PAM_SUCCESS && watchid_session_matches_pam_user(pamh) == 0 {
+        return PAM_IGNORE
+    }
     return result
 }
 

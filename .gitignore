@@ -5,3 +5,4 @@
 *.swo
 ._*
 /.build
+__pycache__/

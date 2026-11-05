@@ -1,0 +1,4 @@
+module PAMSupport {
+    header "PAMSupport.h"
+    export *
+}

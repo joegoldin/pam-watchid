@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Test the real PAM entry point without changing PAM policy or displaying UI.
 
-Only LocalAuthentication and OS session observations are simulated. PAM handles,
-user lookup, module loading, deadlines and cancellation run real code.
+Only the system authorization/UI services and OS session observations are
+simulated. PAM handles, user lookup, module loading, deadline handling and
+callback state transitions run real code.
 """
 
 import ctypes
@@ -21,36 +22,71 @@ MOCK = r'''
 @_exported import Foundation
 
 public enum LAPolicy {
+    case deviceOwnerAuthenticationWithBiometrics
     case deviceOwnerAuthenticationWithBiometricsOrWatch
     case deviceOwnerAuthenticationWithBiometricsOrCompanion
 }
 
-public class LAContext {
-    public init() {}
+public class LAContext: NSObject {
+    @objc public dynamic var optionUserId: NSNumber?
+    public var touchIDAuthenticationAllowableReuseDuration: TimeInterval = 999
+    public override init() { super.init() }
     private var reply: ((Bool, Error?) -> Void)?
+    private var mode: String { ProcessInfo.processInfo.environment["AUTH_TEST"] ?? "" }
+    public override func responds(to selector: Selector!) -> Bool {
+        let name = NSStringFromSelector(selector)
+        if mode == "binding-unavailable" && name == "setOptionUserId:" { return false }
+        if mode == "binding-getter-unavailable" && name == "optionUserId" { return false }
+        return super.responds(to: selector)
+    }
+    public override func setValue(_ value: Any?, forKey key: String) {
+        if key == "optionUserId" {
+            if mode == "binding-error" { return }
+            if mode == "binding-mismatch", let uid = value as? NSNumber {
+                super.setValue(NSNumber(value: uid.uint64Value + 1), forKey: key)
+                return
+            }
+        }
+        super.setValue(value, forKey: key)
+    }
+    public override func value(forKey key: String) -> Any? {
+        if key == "optionUserId" && mode == "binding-nonnumber" { return "not a UID" }
+        return super.value(forKey: key)
+    }
     public func canEvaluatePolicy(_ policy: LAPolicy, error: NSErrorPointer) -> Bool {
-        return ProcessInfo.processInfo.environment["AUTH_TEST"] != "unavailable"
+        print("bound-user=\(optionUserId?.stringValue ?? "unset")")
+        print("reuse=\(touchIDAuthenticationAllowableReuseDuration)")
+        return mode != "unavailable"
     }
     public func evaluatePolicy(_ policy: LAPolicy, localizedReason: String,
                                reply: @escaping (Bool, Error?) -> Void) {
         print("evaluated")
+        print("combined-policy=\(policy != .deviceOwnerAuthenticationWithBiometrics)")
         self.reply = reply
-        switch ProcessInfo.processInfo.environment["AUTH_TEST"] {
+        switch mode {
         case "success": reply(true, nil)
+        case "duplicate-success":
+            reply(true, nil)
+            reply(false, nil)
         case "failure": reply(false, nil)
+        case "user-cancel": reply(false, NSError(domain: "cancel", code: 2))
         case "error": reply(false, NSError(domain: "test", code: 1))
         case "inconsistent-success": reply(true, NSError(domain: "test", code: 1))
         case "late-success":
             DispatchQueue.global().asyncAfter(deadline: .now() + 6) {
                 reply(true, nil)
+                print("late reply delivered")
             }
         default: break
         }
     }
     public func invalidate() {
         print("invalidated")
-        if ProcessInfo.processInfo.environment["AUTH_TEST"] == "cancel-reply" {
-            reply?(false, NSError(domain: "cancel", code: 1))
+        if mode == "cancel-reply", let callback = reply {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                callback(false, NSError(domain: "cancel", code: 1))
+                print("cancellation reply delivered")
+            }
         }
     }
 }
@@ -88,7 +124,7 @@ def invoke(library_path):
         print(f'elapsed={time.monotonic() - start}', flush=True)
     finally:
         pam.pam_end(handle, 0)
-    if os.environ.get('AUTH_TEST') == 'late-success':
+    if os.environ.get('AUTH_TEST') in ('late-success', 'cancel-reply'):
         _ctypes.dlclose(library._handle)
         time.sleep(2)
         print('survived late reply after pam_end and dlclose', flush=True)
@@ -160,6 +196,41 @@ class AuthenticationTests(unittest.TestCase):
     def test_success_authenticates_matching_user(self):
         self.authenticate(expected=0)
 
+    def test_context_is_bound_to_verified_pam_uid(self):
+        output = self.authenticate(expected=0)
+        self.assertIn(f'bound-user={os.getuid()}\n', output)
+
+    def test_root_authenticator_binds_nonroot_pam_uid(self):
+        output = self.authenticate(expected=0, SESSION_TEST='root-authenticator')
+        self.assertIn(f'bound-user={os.getuid()}\n', output)
+
+    def test_one_combined_request_with_reuse_disabled(self):
+        output = self.authenticate(expected=0)
+        self.assertEqual(output.splitlines().count('evaluated'), 1)
+        self.assertIn('combined-policy=true\n', output)
+        self.assertIn('reuse=0.0\n', output)
+
+    def test_missing_uid_setter_skips_authentication(self):
+        self.assert_skipped(mode='binding-unavailable')
+
+    def test_missing_uid_getter_skips_authentication(self):
+        self.assert_skipped(mode='binding-getter-unavailable')
+
+    def test_ignored_uid_binding_falls_through(self):
+        self.assert_skipped(mode='binding-error')
+
+    def test_non_numeric_uid_readback_falls_through(self):
+        self.assert_skipped(mode='binding-nonnumber')
+
+    def test_user_cancel_falls_through(self):
+        self.authenticate('user-cancel')
+
+    def test_wrong_bound_uid_cannot_authenticate(self):
+        self.assert_skipped(mode='binding-mismatch')
+
+    def test_duplicate_reply_cannot_change_success(self):
+        self.authenticate('duplicate-success', expected=0)
+
     def test_different_pam_user_cannot_authenticate(self):
         self.assert_skipped(PAM_TEST_USER='root')
 
@@ -205,18 +276,21 @@ class AuthenticationTests(unittest.TestCase):
     def test_error_falls_through(self):
         self.authenticate('error')
 
-    def test_inconsistent_success_with_error_falls_through(self):
+    def test_success_with_error_falls_through(self):
         self.authenticate('inconsistent-success')
 
     def test_unavailable_biometrics_falls_through(self):
         self.authenticate('unavailable')
 
     def test_cancellation_callback_cannot_authenticate(self):
-        self.authenticate('cancel-reply', timed_out=True)
+        output = self.authenticate('cancel-reply', timed_out=True)
+        self.assertIn('cancellation reply delivered', output)
+        self.assertIn('survived late reply after pam_end and dlclose', output)
 
     def test_late_success_after_pam_end_and_dlclose_cannot_authenticate(self):
         output = self.authenticate('late-success', timed_out=True)
         self.assertIn('survived late reply after pam_end and dlclose', output)
+        self.assertIn('late reply delivered', output)
 
 
 if __name__ == '__main__':

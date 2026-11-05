@@ -4,11 +4,12 @@
 #include <dlfcn.h>
 #include <pwd.h>
 #include <security/pam_appl.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-int watchid_session_matches_pam_user(const void *handle)
+int watchid_session_user(const void *handle, uint32_t *uid)
 {
     const pam_handle_t *pamh = handle;
     const void *item = NULL;
@@ -46,7 +47,14 @@ int watchid_session_matches_pam_user(const void *handle)
         return 0;
     if (stat("/dev/console", &console) != 0 || console.st_uid != account.pw_uid)
         return 0;
+    if (uid != NULL)
+        *uid = account.pw_uid;
     return 1;
+}
+
+int watchid_session_matches_pam_user(const void *handle)
+{
+    return watchid_session_user(handle, NULL);
 }
 
 int watchid_pin_module(void)
@@ -54,7 +62,7 @@ int watchid_pin_module(void)
     Dl_info info;
     void *handle;
 
-    // invalidate() delivers its reply asynchronously. PAM may dlclose us as
+    // Cancellation delivers its reply asynchronously. PAM may dlclose us as
     // soon as authentication returns; keep callback code mapped until exit.
     if (dladdr((const void *)&watchid_pin_module, &info) == 0)
         return 0;
